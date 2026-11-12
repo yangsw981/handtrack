@@ -180,6 +180,7 @@ FPS = 15                     # 采集节拍：关键路径优化后整循环实�
 # 里的窗口合成与刷新。采集时不需要看画面就把它关掉；按键（空格/Q/D）仍然有效。
 PREVIEW_ENABLED = False
 PREVIEW_MAX_WIDTH = 1600        # 预览画布最大宽度，越小 waitKey 越便宜
+_HAS_POLLKEY = hasattr(cv2, "pollKey")   # v6.5: pollKey 不睡眠，替代 waitKey(1)
 # 三台相机没有硬触发线，自由运行必然存在一个"恒定相位差"(实测中位 30ms)。
 # 这个偏差由启动相位和晶振决定、逐帧重复，是硬件属性而不是采集失败；
 # 软件真正该管的是相位差【之外】的抖动，所以这里拆成两个量统计。
@@ -267,6 +268,20 @@ BONE_GROSS_REL = 0.25       # 骨长偏离模型 25% 以上判定为"解崩了"�
 SIGMA_TRI = 0.010           # 三角化先验标准差(m)
 W_TRI = 1.0                 # 三角化先验权重
 TRI_MAX_RMS_PX = 6.0        # 三角化内点判据(px)，超过则该关节本轮不用先验
+
+# ---------------- v6.5：三路一致性加权 ----------------
+# 证据(episode_20261112_190213)：47% 的帧重投影 >8px，最差的点全在 Cam2 指尖，
+# 单点偏差 130-160px，而 MediaPipe 报的置信度很高(inferred=False)——它是"自信地错"。
+# 旧逻辑用三路等权 DLT 三角化，一个 140px 的离群点会把该关节的 RMS 顶穿
+# TRI_MAX_RMS_PX=6，于是【整个关节被丢掉先验】，初值退化成单路深度点，越修越糟。
+# 新逻辑：先等权求一次；若某一路明显偏离"其余视角的共识"，把它们剔出去重三角化，
+# 并在本帧 GN 里把那一路降权，而不是整体丢弃。
+CONSENSUS_ENABLE = True
+CONSENSUS_OUTLIER_PX = 10.0     # 某一路偏离共识超过这么多 px 才考虑剔除
+CONSENSUS_OUTLIER_RATIO = 2.5   # 且必须超过其余视角残差中位的这么多倍
+CONSENSUS_DOWN_W = 0.20         # 被判离群的那一路，在 GN 里保留 20% 权重
+_consensus_stat = {"drop": 0, "tri": 0}
+
 DEPTH_W = 0.50              # 深度项整体权重
 DEPTH_PALM_W = 0.15         # 腕/掌部关节深度额外降权(评测里它们最差)
 DEPTH_SIGMA_FLOOR = 0.020   # 深度标准差下限：局部 std 低估了"测到的不是手"的系统误差
@@ -433,15 +448,59 @@ def _collect_obs(obs_by_cam):
                 if j in PALM_JOINTS:
                     wd *= DEPTH_PALM_W
                 dep_obs.append((j, o.p3d, dvec / nd,
-                                max(float(o.sigma), DEPTH_SIGMA_FLOOR), wd))
+                                max(float(o.sigma), DEPTH_SIGMA_FLOOR), wd, c))
                 n_obs[j] += 1
     return uv_obs, dep_obs, n_obs
 
 
-def _triangulated_priors(uv_obs, cams):
+def _triangulate_consensus(cams, uvs):
+    """带一致性判据的多视角三角化。
+
+    返回 (X, errs, keep)：errs 与输入逐项对齐（被判离群的那一路给 nan），
+    keep 是布尔数组，False 表示这一路与本帧共识明显不一致。
+
+    为什么不用"RMS 最小的子集"：两路三角化对 3 个未知量有 4 个方程，
+    几乎总能拟合到接近 0 的 RMS，按 RMS 选子集必然过拟合到剩下那两路。
+    所以判据是【这一路相对其余视角共识的偏离】：只有它同时超过绝对阈值
+    CONSENSUS_OUTLIER_PX 和其余视角中位残差的 CONSENSUS_OUTLIER_RATIO 倍，
+    才把它剔出去、用剩下的视角重算。
+    """
+    n = len(uvs)
+    keep = np.ones(n, dtype=bool)
+    if n < 2:
+        return None, None, keep
+    X, errs = triangulate(cams, uvs)
+    if X is None or errs is None or not np.isfinite(errs).all():
+        return X, errs, keep
+    if not CONSENSUS_ENABLE or n < 3:
+        return X, errs, keep
+
+    worst = int(np.argmax(errs))
+    rest = np.delete(np.asarray(errs, dtype=np.float64), worst)
+    med_rest = float(np.median(rest)) if rest.size else 0.0
+    if (errs[worst] <= CONSENSUS_OUTLIER_PX
+            or errs[worst] <= CONSENSUS_OUTLIER_RATIO * max(med_rest, 1.0)):
+        return X, errs, keep
+
+    idx = [i for i in range(n) if i != worst]
+    X2, e2 = triangulate([cams[i] for i in idx], [uvs[i] for i in idx])
+    if X2 is None or e2 is None or not np.isfinite(X2).all():
+        return X, errs, keep
+
+    keep[worst] = False
+    out = np.full(n, np.nan, dtype=np.float64)
+    for k, i in enumerate(idx):
+        out[i] = float(e2[k])
+    _consensus_stat["drop"] += 1
+    return X2, out, keep
+
+
+def _triangulated_priors(uv_obs, cams, down=None):
     """
     把每帧所有 2D 观测按关节分组做多视角三角化，得到"2D 的最优融合点"。
-    只保留重投影 RMS <= TRI_MAX_RMS_PX 的关节（自洽才值得信）。
+    v6.5：走 _triangulate_consensus，一路明显飘的视角会被剔除，并在 down 里
+    登记降权——而不是像旧版那样因为 RMS 超标把整个关节的先验全丢掉。
+    只保留剩余视角重投影 RMS <= TRI_MAX_RMS_PX 的关节（自洽才值得信）。
     返回 {j: (X, rms_px)}
     """
     by_j = {}
@@ -453,13 +512,21 @@ def _triangulated_priors(uv_obs, cams):
             continue
         cs = [cams[c] for (c, u, v) in items]
         uvs = [(u, v) for (c, u, v) in items]
-        X, errs = triangulate(cs, uvs)
+        X, errs, keep = _triangulate_consensus(cs, uvs)
         if X is None or errs is None:
             continue
-        rms = float(np.sqrt(np.mean(np.square(errs))))
+        fin = np.asarray(errs, dtype=np.float64)
+        fin = fin[np.isfinite(fin)]
+        if fin.size == 0:
+            continue
+        rms = float(np.sqrt(np.mean(np.square(fin))))
         if not np.isfinite(rms) or rms > TRI_MAX_RMS_PX:
             continue
         out[int(j)] = (np.asarray(X, dtype=np.float64), rms)
+        _consensus_stat["tri"] += 1
+        if down is not None and not keep.all():
+            for k in np.nonzero(~keep)[0]:
+                down[(items[k][0], int(j))] = CONSENSUS_DOWN_W
     return out
 
 
@@ -474,7 +541,8 @@ def _init_pose(uv_obs, dep_obs, prev, cams, tri=None):
         for j, (Xt, rms) in tri.items():
             if np.isfinite(Xt).all():
                 X[j] = Xt
-    for (j, p, dvec, s, w) in dep_obs:
+    for item in dep_obs:                     # v6.5: 元组末尾多了相机号
+        j, p = item[0], item[1]
         if np.isfinite(X[j]).all():
             continue
         X[j] = p.copy() if not np.isfinite(X[j]).all() else 0.5 * (X[j] + p)
@@ -542,7 +610,8 @@ def solve_pose(obs_by_cam, cams, prev=None, boneL=None, boneX=None,
         return np.full((21, 3), np.nan), n_obs.astype(np.float64), \
                np.zeros(21, dtype=np.int32)
 
-    tri = _triangulated_priors(uv_obs, cams)
+    down = {}
+    tri = _triangulated_priors(uv_obs, cams, down)
     X = _init_pose(uv_obs, dep_obs, prev, cams, tri)
 
     # ---- 组装骨长约束 ----
@@ -581,7 +650,8 @@ def solve_pose(obs_by_cam, cams, prev=None, boneL=None, boneX=None,
             P = cams[c]["P"]
             idx = np.array([it[1] for it in items], dtype=np.int64)
             uv = np.array([[it[2], it[3]] for it in items])
-            w0 = np.array([it[4] for it in items])
+            w0 = np.array([it[4] * down.get((it[0], int(it[1])), 1.0)
+                           for it in items])
 
             Xs = X[idx]
             hom = np.hstack([Xs, np.ones((len(idx), 1))]) @ P.T     # k,3
@@ -621,7 +691,8 @@ def solve_pose(obs_by_cam, cams, prev=None, boneL=None, boneX=None,
             pp = np.array([d[1] for d in dep_obs])
             dd = np.array([d[2] for d in dep_obs])      # 单位视线方向 k,3
             ss = np.array([d[3] for d in dep_obs])
-            w0 = np.array([d[4] for d in dep_obs])
+            w0 = np.array([d[4] * down.get((d[5], int(d[0])), 1.0)
+                           for d in dep_obs])
             r = np.einsum("kj,kj->k", dd, X[jj] - pp)   # 沿视线的标量残差 k
             e = np.abs(r)
             w = w0 * _huber(e, HUBER_DEP) / np.maximum(ss, 0.002) ** 2
@@ -2046,8 +2117,10 @@ def _prof_line():
                        for k in ("align", "mp", "core", "depth"))
     else:
         det = ""
-    return "ms/f: %s other %.0f = %.0f | front 细分: %s" % (
-        parts, other, _prof["frame"] / n, det)
+    return "ms/f: %s other %.0f = %.0f | front 细分: %s%s" % (
+        parts, other, _prof["frame"] / n, det,
+        ("  共识剔除 %d/%d" % (_consensus_stat["drop"], _consensus_stat["tri"]))
+        if CONSENSUS_ENABLE else "")
 
 
 # ---- 启动看门狗：逐路 wait_for_frames 把流"点着"，点不着就明确报错退出 ----
@@ -2408,7 +2481,13 @@ try:
             _prof["n"] = 0
 
         _t_key = time.perf_counter()
-        key = cv2.waitKey(1) & 0xFF
+        # v6.5: waitKey(1) 在 Windows 上会按系统定时器粒度睡一下，实测平均 6.7ms，
+        # 与窗口大小无关（关预览、缩小窗口都只降到 6.7）。改用 pollKey()：只泵一次
+        # 消息队列、不睡眠，没有按键时返回 -1。老版本 OpenCV 没有这个函数，回退。
+        if _HAS_POLLKEY:
+            key = cv2.pollKey() & 0xFF
+        else:
+            key = cv2.waitKey(1) & 0xFF
         _prof_add("key", _t_key)
         _prof["frame"] += (time.perf_counter() - _t_frame) * 1000.0
         _prof_total["frame"] += (time.perf_counter() - _t_frame) * 1000.0
